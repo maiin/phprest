@@ -1,6 +1,6 @@
 <?php
 /**
- * PHABLE CORE API - v2.9.0
+ * PHABLE CORE API - v0.1
  * architecture: "Frozen Core with Plugin Bridge"
  * security: "Stateless JWT Auth"
  * tools: "Integrated /stresstest UI"
