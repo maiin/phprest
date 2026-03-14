@@ -1,42 +1,49 @@
 <?php
-/**
- * PHABLE CORE API - v0.1
- * architecture: "Frozen Core with Plugin Bridge"
- * security: "Stateless JWT Auth"
- */
+// PHABLE CORE API - v0.1
+// architecture: "Frozen Core with Plugin Bridge"
+// security: "Stateless JWT Auth"
 
-// Error reporting for debugging (Disable in production)
+
+
+
+
+// PART 1 - Helper functions & setup
+
+// Displaying or hiding logs
 ini_set('display_errors', 0); 
 error_reporting(E_ALL);
 
+
+// Communication between servers (CORS)
 $method = $_SERVER['REQUEST_METHOD'];
 $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
 $host   = (isset($_SERVER['HTTPS']) ? 'https' : 'http') . '://' . $_SERVER['HTTP_HOST'];
-
 if ($method === 'GET' || $method === 'OPTIONS') {
     header("Access-Control-Allow-Origin: *");
-} elseif ($origin === $host) {
+} elseif ($origin === $host || $origin === '') {
     header("Access-Control-Allow-Origin: $origin");
 } else {
     http_response_code(403);
     echo json_encode(['error' => 'Cross-origin writes not allowed']);
     exit;
 }
-
 header("Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS");
 header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With");
 header('Content-Type: application/json');
-
 if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') exit;
 
+// Configuration
 $configFile = __DIR__ . '/config.php';
 $pluginFile = __DIR__ . '/plugins.php';
 $secret = getenv('SECRET_CODE') ?: null;
 
+// Create a slug
 function createSlug($str) { return strtolower(trim(preg_replace('/[^A-Za-z0-9-]+/', '-', $str), '-')); }
+
+// Send API response
 function api($data, $code = 200) { http_response_code($code); echo json_encode($data, JSON_PRETTY_PRINT); exit; }
 
-// --- JWT ENGINE ---
+// Token generation
 function jwt_encode($payload, $secret) {
     $h = str_replace(['+', '/', '='], ['-', '_', ''], base64_encode(json_encode(['typ'=>'JWT','alg'=>'HS256'])));
     $p = str_replace(['+', '/', '='], ['-', '_', ''], base64_encode(json_encode($payload)));
@@ -44,6 +51,7 @@ function jwt_encode($payload, $secret) {
     return "$h.$p.$s";
 }
 
+// Token validation
 function jwt_decode($t, $secret) {
     if (!$secret) return null; // no secret = treat as unauthenticated
     if(!$t) return null;
@@ -52,15 +60,16 @@ function jwt_decode($t, $secret) {
     return ($s === $p[2]) ? json_decode(base64_decode(strtr($p[1], '-_', '+/')), true) : null;
 }
 
-// --- AUTH ORCHESTRATOR ---
+// Authorization
 $headers = getallheaders();
-$auth = $headers['Authorization'] ?? $headers['authorization'] ?? '';
+$auth = $headers['Authorization'] ?? $headers['authorization'] ?? $_SERVER['HTTP_AUTHORIZATION'] ?? '';
 $token = str_replace('Bearer ', '', $auth);
 $jwt = jwt_decode($token, $secret);
 $uID = $jwt['uid'] ?? null;
 $role = $jwt['role'] ?? 0;
 $isAdmin = ($role >= 3);
 
+// Rights
 function check_rights($matrix, $user_role) {
     $m = $_SERVER['REQUEST_METHOD'];
     $map = ['GET'=>0, 'POST'=>1, 'PATCH'=>2, 'DELETE'=>3];
@@ -69,32 +78,68 @@ function check_rights($matrix, $user_role) {
     if ($user_role < $req) api(['error'=>'Forbidden', 'req'=>$req, 'lvl'=>$user_role], 403);
 }
 
-// --- DB INITIALIZATION ---
+// Anti spam
+function check_rate_limit($email) {
+    $file = sys_get_temp_dir() . '/ph_rl_' . md5($email);
+    $now  = time();
+    $data = file_exists($file) ? json_decode(file_get_contents($file), true) : ['count'=>0, 'window_start'=>$now];
+
+    if ($now - $data['window_start'] > 300) {
+        $data = ['count'=>0, 'window_start'=>$now];
+    }
+
+    $data['count']++;
+    file_put_contents($file, json_encode($data), LOCK_EX);
+
+    if ($data['count'] > 10) {
+        api(['error' => 'Too many login attempts, try again later'], 429);
+    }
+}
+
+// Database creation on first start
 if (!file_exists($configFile)) {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         try {
-            $h=$_POST['db_h']; $n=$_POST['db_n']; $u=$_POST['db_u']; $p=$_POST['db_p'];
+            $h = preg_replace('/[^a-zA-Z0-9.\-]/', '', $_POST['db_h']);
+            $n = str_replace('`', '', $_POST['db_n']);
+            $u = str_replace(["'", "\\"], '', $_POST['db_u']);
+            $p = str_replace(["'", "\\"], '', $_POST['db_p']);
+            $prefix = preg_replace('/[^a-zA-Z0-9_]/', '', $_POST['db_prefix'] ?: 'xsrest_');
+
             $db = new PDO("mysql:host=$h", $u, $p, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
             $db->exec("CREATE DATABASE IF NOT EXISTS `$n`; USE `$n`;");
-            $db->exec("CREATE TABLE IF NOT EXISTS ph_users (id INT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(255) UNIQUE, password VARCHAR(255), role TINYINT DEFAULT 1);");
-            $db->exec("CREATE TABLE IF NOT EXISTS ph_phables (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, pageslug VARCHAR(255) UNIQUE, type VARCHAR(50), belongsto VARCHAR(50), is_published TINYINT(1) DEFAULT 0, data JSON, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);");
-            $db->exec("CREATE TABLE IF NOT EXISTS ph_blocks (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, pageslug VARCHAR(255) UNIQUE, type VARCHAR(50), belongsto VARCHAR(50), is_published TINYINT(1) DEFAULT 0, data JSON, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);");
-            $db->prepare("INSERT IGNORE INTO ph_users (email, password, role) VALUES (?, ?, 3)")->execute([$_POST['admin_e'], password_hash($_POST['admin_p'], PASSWORD_DEFAULT)]);
-            file_put_contents($configFile, "<?php\n\$db_host='$h';\n\$db_name='$n';\n\$db_user='$u';\n\$db_pass='$p';");
-            api(['status' => 'Installed']);
+            $db->exec("CREATE TABLE IF NOT EXISTS {$prefix}users (id INT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(255) UNIQUE, password VARCHAR(255), role TINYINT DEFAULT 1);");
+            $db->exec("CREATE TABLE IF NOT EXISTS {$prefix}phables (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, pageslug VARCHAR(255) UNIQUE, type VARCHAR(50), belongsto VARCHAR(50), is_published TINYINT(1) DEFAULT 0, data JSON, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);");
+            $db->exec("CREATE TABLE IF NOT EXISTS {$prefix}blocks (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, pageslug VARCHAR(255) UNIQUE, type VARCHAR(50), belongsto VARCHAR(50), is_published TINYINT(1) DEFAULT 0, data JSON, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);");
+            $db->prepare("INSERT IGNORE INTO {$prefix}users (email, password, role) VALUES (?, ?, 3)")->execute([$_POST['admin_e'], password_hash($_POST['admin_p'], PASSWORD_DEFAULT)]);
+            file_put_contents($configFile, "<?php\n\$db_host='$h';\n\$db_name='$n';\n\$db_user='$u';\n\$db_pass='$p';\n\$db_prefix='$prefix';");
+            api(['status' => 'Installed', 'prefix' => $prefix]);
         } catch (Exception $e) { api(['error' => $e->getMessage()], 500); }
     }
     header('Content-Type: text/html');
-    echo "<h3>Phable v0.1 Installer</h3><form method='POST'><input name='db_h' value='localhost'><input name='db_n' placeholder='DB Name'><input name='db_u' placeholder='DB User'><input name='db_p' type='password' placeholder='DB Pass'><hr><input name='admin_e' placeholder='Admin Email'><input name='admin_p' placeholder='Admin Pass'><button>Install</button></form>";
+    echo "<h3>Phable v0.1 Installer</h3>
+    <form method='POST'>
+        <input name='db_h' value='localhost' placeholder='DB Host'>
+        <input name='db_n' placeholder='DB Name'>
+        <input name='db_u' placeholder='DB User'>
+        <input name='db_p' type='password' placeholder='DB Pass'>
+        <hr>
+        <input name='db_prefix' value='xsrest_' placeholder='Table prefix (e.g. xsrest_)'>
+        <hr>
+        <input name='admin_e' placeholder='Admin Email'>
+        <input name='admin_p' placeholder='Admin Pass'>
+        <button>Install</button>
+    </form>";
     exit;
 }
 
 require $configFile;
+$prefix = $db_prefix ?? 'xsrest_';
 try { 
     $pdo = new PDO("mysql:host=$db_host;dbname=$db_name;charset=utf8mb4", $db_user, $db_pass, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]); 
 } catch (PDOException $e) { api(['error' => 'DB Fail'], 500); }
 
-// --- ROUTING ---
+// Params from URL
 $uri = str_replace([str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'])), 'index.php'], '', parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH));
 $parts = explode('/', trim($uri, '/'));
 $res = $parts[0] ?: 'info'; 
@@ -103,6 +148,10 @@ $subId = $parts[2] ?? null; // Add this to capture the actual ID/Slug
 $in = json_decode(file_get_contents('php://input'), true);
 
 
+
+
+
+// PART 2
 
 // --- COLLECTION HANDLER FUNCTION ---
 // Full CRUD handler for any standard-schema table.
@@ -176,14 +225,30 @@ function collection_handler($table, $rights, $pdo, $id, $subId, $in, $uID, $role
     }
 
     if ($method === 'POST') {
-        // POST /{collection}
-        // Body: { pageslug?, type?, belongsto?, data: { title, tags: [...], ... } }
-        $slug      = (!empty($in['pageslug'])) ? createSlug($in['pageslug']) : createSlug($in['data']['title'] ?? 'untitled');
+
+        $slug = (!empty($in['pageslug'])) ? createSlug($in['pageslug']) : createSlug($in['data']['title'] ?? 'untitled');
+
+        // Make slug unique by appending a number if it already exists
+        $baseSlug = $slug;
+        $counter  = 1;
+        while (true) {
+            $check = $pdo->prepare("SELECT id FROM $table WHERE pageslug = ? LIMIT 1");
+            $check->execute([$slug]);
+            if (!$check->fetch()) break;
+            $slug = $baseSlug . '-' . $counter;
+            $counter++;
+        }
+
         $type      = $in['type']      ?? null;
         $belongsto = $in['belongsto'] ?? null;
-        $pdo->prepare("INSERT INTO $table (user_id, pageslug, type, belongsto, data, is_published) VALUES (?, ?, ?, ?, ?, ?)")
-            ->execute([$uID, $slug, $type, $belongsto, json_encode($in['data'] ?? []), ($role >= 2 ? 1 : 0)]);
-        api(['id' => $pdo->lastInsertId(), 'slug' => $slug], 201);
+
+        try {
+            $pdo->prepare("INSERT INTO $table (user_id, pageslug, type, belongsto, data, is_published) VALUES (?, ?, ?, ?, ?, ?)")
+                ->execute([$uID, $slug, $type, $belongsto, json_encode($in['data'] ?? []), ($role >= 2 ? 1 : 0)]);
+            api(['id' => $pdo->lastInsertId(), 'slug' => $slug], 201);
+        } catch (PDOException $e) {
+            api(['error' => 'Database error', 'code' => $e->getCode()], 500); //
+        }
     }
 
     if ($method === 'PATCH') {
@@ -208,38 +273,57 @@ function collection_handler($table, $rights, $pdo, $id, $subId, $in, $uID, $role
     }
 
     if ($method === 'DELETE') {
-        // DELETE /{collection}/:id
+        // DELETE requires a numeric ID (not slug) — intentional, to prevent
+        // replayed or cached requests from hitting a re-created record with the same slug.
         if (!$id) api(['error' => 'ID required for DELETE'], 400);
         $pdo->prepare("DELETE FROM $table WHERE id = ?")->execute([$id]);
         api(['status' => 'Deleted']);
     }
 }
 
+
+
+
+
+// PART 3
+
 switch ($res) {
-case 'user':
-    if ($id === 'login') {
-        if (empty($in['email'])) api(['error'=>'No credentials'], 400);
-        $u = $pdo->prepare("SELECT * FROM ph_users WHERE email=?");
-        $u->execute([$in['email']]);
-        $user = $u->fetch();
-        if ($user && password_verify($in['password'], $user['password'])) {
-            $uRole = isset($user['role']) ? (int)$user['role'] : (($user['is_admin']??0) ? 3 : 1);
-            if (!$secret) api(['error' => 'Server misconfiguration'], 500);
-            $token = jwt_encode(['uid'=>$user['id'], 'role'=>$uRole, 'iat'=>time()], $secret);
-            api(['status'=>'Success', 'token'=>$token, 'role'=>$uRole]);
+    case 'jwttest':
+        if (!$isAdmin) api(['error' => 'Forbidden'], 403);
+        $result = jwt_decode($token, $secret);
+        api([
+            'token_received' => !empty($token),
+            'decode_result'  => $result,
+            'role_set_to'    => $role,
+        ]);
+        break;
+
+    case 'user':
+        if ($id === 'login') {
+            if (empty($in['email'])) api(['error'=>'No credentials'], 400);
+            check_rate_limit($in['email']);
+
+            $u = $pdo->prepare("SELECT * FROM {$prefix}users WHERE email=?");
+            $u->execute([$in['email']]);
+            $user = $u->fetch();
+            if ($user && password_verify($in['password'], $user['password'])) {
+                $uRole = isset($user['role']) ? (int)$user['role'] : (($user['is_admin']??0) ? 3 : 1);
+                if (!$secret) api(['error' => 'Server misconfiguration'], 500);
+                $token = jwt_encode(['uid'=>$user['id'], 'role'=>$uRole, 'iat'=>time()], $secret);
+                api(['status'=>'Success', 'token'=>$token, 'role'=>$uRole]);
+            }
+            api(['error'=>'Auth Failed'], 401);
+        } else {
+            check_rights([3,3,3,3]);
+            try {
+                api($pdo->query("SELECT id, email, role FROM {$prefix}users")->fetchAll());
+            } catch (Exception $e) {
+                $pdo->exec("ALTER TABLE {$prefix}users ADD COLUMN role TINYINT DEFAULT 1");
+                $pdo->exec("UPDATE {$prefix}users SET role = 3 WHERE is_admin = 1");
+                api($pdo->query("SELECT id, email, role FROM {$prefix}users")->fetchAll());
+            }
         }
-        api(['error'=>'Auth Failed'], 401);
-    } else {
-        check_rights([3,3,3,3]);
-        try {
-            api($pdo->query("SELECT id, email, role FROM ph_users")->fetchAll());
-        } catch (Exception $e) {
-            $pdo->exec("ALTER TABLE ph_users ADD COLUMN role TINYINT DEFAULT 1");
-            $pdo->exec("UPDATE ph_users SET role = 3 WHERE is_admin = 1");
-            api($pdo->query("SELECT id, email, role FROM ph_users")->fetchAll());
-        }
-    }
-    break;
+        break;
 
     // -------------------------------------------------------------------------
     // COLLECTION HANDLER
@@ -272,11 +356,11 @@ case 'user':
     case 'phable':
         // phable is the first built-in collection — registered directly in the switch.
         // This proves the collection_handler pattern works without a plugin file.
-        collection_handler('ph_phables', [0, 1, 2, 3], $pdo, $id, $subId, $in, $uID, $role);
+        collection_handler($prefix . 'phables', [0, 1, 2, 3], $pdo, $id, $subId, $in, $uID, $role);
         break;
 
     case 'blocks':
-        collection_handler('ph_blocks', [0, 1, 2, 3], $pdo, $id, $subId, $in, $uID, $role);
+        collection_handler($prefix . 'blocks', [0, 1, 2, 3], $pdo, $id, $subId, $in, $uID, $role);
         break;
 
     default:
