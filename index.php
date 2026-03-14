@@ -31,7 +31,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') exit;
 
 $configFile = __DIR__ . '/config.php';
 $pluginFile = __DIR__ . '/plugins.php';
-$secret = getenv('JCXRPC') ?: null;
+$secret = getenv('SECRET_CODE') ?: null;
 
 function createSlug($str) { return strtolower(trim(preg_replace('/[^A-Za-z0-9-]+/', '-', $str), '-')); }
 function api($data, $code = 200) { http_response_code($code); echo json_encode($data, JSON_PRETTY_PRINT); exit; }
